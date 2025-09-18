@@ -8,6 +8,8 @@ const {
   forceSummarize,
   forceTags,
   activityFeed,
+  getDocumentVersions,
+  restoreVersion
 } = require('../controllers/document.controller');
 const { authenticate } = require('../middleware/auth');
 
@@ -20,6 +22,10 @@ router.get('/', authenticate, getDocuments);
 router.get('/:id', authenticate, getDocumentById);
 router.put('/:id', authenticate, updateDocument);
 router.delete('/:id', authenticate, deleteDocument);
+
+// Versioning
+router.get('/:id/versions', authenticate, getDocumentVersions);
+router.post('/:id/versions/:versionNumber/restore', authenticate, restoreVersion);
 
 // AI actions
 router.post('/:id/summarize', authenticate, forceSummarize);

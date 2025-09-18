@@ -1,31 +1,48 @@
 const Document = require('../models/Document');
 const Activity = require('../models/Activity');
 const { summarizeText, generateTags, embedText } = require('../utils/gemini');
+const { default: mongoose } = require('mongoose');
 
 // Helpers
 function canModify(user, doc) {
   return user.role === 'admin' || String(doc.createdBy) === String(user._id);
 }
 
+// Helper to log activity
+async function logActivity(action, document, user, versionNumber = null, changes = {}) {
+  try {
+    await Activity.create({
+      action,
+      document: document._id,
+      documentTitle: document.title,
+      versionNumber: versionNumber || document.currentVersion,
+      user: user._id,
+      changes: {
+        title: changes.title || false,
+        content: changes.content || false,
+        tags: changes.tags || false,
+        summary: changes.summary || false
+      },
+      metadata: {
+        previousVersion: changes.previousVersion || null,
+        newVersion: changes.newVersion || null
+      }
+    });
+  } catch (error) {
+    console.error('Error logging activity:', error);
+  }
+}
+
 exports.createDocument = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { title, content, tags } = req.body;
-    if (!title || !content) return res.status(400).json({ message: 'Title and content are required' });
-
-    // Debug logging for incoming data and user context
-    try {
-      console.log('[createDocument] Incoming payload:', {
-        title,
-        contentLength: typeof content === 'string' ? content.length : null,
-        tags,
-      });
-      console.log('[createDocument] Authenticated user:', {
-        id: req.user?._id,
-        email: req.user?.email,
-        role: req.user?.role,
-      });
-    } catch (_) {
-      // avoid crashing on logging
+    if (!title || !content) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ message: 'Title and content are required' });
     }
 
     // AI assist
@@ -35,31 +52,32 @@ exports.createDocument = async (req, res) => {
       embedText(`${title}\n${content}`),
     ]);
 
-    // Debug logging for AI outputs (sizes only to avoid dumping huge data)
-    try {
-      console.log('[createDocument] AI outputs:', {
-        summaryLength: typeof summary === 'string' ? summary.length : null,
-        autoTags,
-        embeddingLength: Array.isArray(embedding) ? embedding.length : null,
-      });
-    } catch (_) {}
-
-    const doc = await Document.create({
+    // Create the document
+    const doc = new Document({
       title,
       content,
       summary,
-      tags: Array.from(new Set([...(tags || []), ...autoTags])).slice(0, 10),
+      tags: tags || autoTags,
       embedding,
       createdBy: req.user._id,
-      versions: [],
+      lastUpdatedBy: req.user._id
     });
 
-    await Activity.create({ action: 'created', document: doc._id, user: req.user._id });
-
-    res.status(201).json(doc);
+    await doc.save({ session });
+    
+    // Log the creation activity
+    await logActivity('created', doc, req.user);
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Return the document with versions populated
+    const savedDoc = await Document.findById(doc._id).populate('createdBy', 'name email').populate('lastUpdatedBy', 'name email');
+    res.status(201).json(savedDoc);
   } catch (err) {
-    // Log full error for debugging
-    console.error('CreateDocument error:', err && err.stack ? err.stack : err);
+    await session.abortTransaction();
+    session.endSession();
+    console.error('Error creating document:', err);
     res.status(500).json({ message: 'Failed to create document', error: err.message });
   }
 };
@@ -110,57 +128,137 @@ exports.getDocumentById = async (req, res) => {
 };
 
 exports.updateDocument = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     const { title, content, tags } = req.body;
-    const doc = await Document.findById(req.params.id);
-    if (!doc) return res.status(404).json({ message: 'Document not found' });
-    if (!canModify(req.user, doc)) return res.status(403).json({ message: 'Forbidden' });
+    const doc = await Document.findById(req.params.id).session(session);
+    
+    if (!doc) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Document not found' });
+    }
+    
+    if (!canModify(req.user, doc)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(403).json({ message: 'Forbidden' });
+    }
 
-    // Save version
-    doc.versions.push({
+    // Track changes
+    const changes = {
+      title: title !== undefined && title !== doc.title,
+      content: content !== undefined && content !== doc.content,
+      tags: tags !== undefined && JSON.stringify(tags) !== JSON.stringify(doc.tags),
+      summary: false // Will be set to true if content changes
+    };
+
+    // Save current state for diffing
+    const previousState = {
       title: doc.title,
       content: doc.content,
       summary: doc.summary,
-      tags: doc.tags,
-      editedBy: req.user._id,
-    });
+      tags: [...doc.tags]
+    };
 
+    // Update document fields if provided
     if (title !== undefined) doc.title = title;
     if (content !== undefined) doc.content = content;
     if (tags !== undefined) doc.tags = tags;
 
     // Recompute AI fields if content/title changed
-    if (title !== undefined || content !== undefined) {
+    if (changes.content || changes.title) {
       const [summary, autoTags, embedding] = await Promise.all([
         summarizeText(doc.content),
         generateTags(`${doc.title}\n${doc.content}`, 6),
         embedText(`${doc.title}\n${doc.content}`),
       ]);
+      
+      changes.summary = doc.summary !== summary;
       doc.summary = summary;
       doc.embedding = embedding;
+      
       if (!tags) {
-        doc.tags = Array.from(new Set([...(doc.tags || []), ...autoTags])).slice(0, 10);
+        const newTags = Array.from(new Set([...(doc.tags || []), ...autoTags])).slice(0, 10);
+        changes.tags = changes.tags || JSON.stringify(newTags) !== JSON.stringify(doc.tags);
+        doc.tags = newTags;
       }
     }
 
-    await doc.save();
-    await Activity.create({ action: 'updated', document: doc._id, user: req.user._id });
+    // Only create a new version if there are actual changes
+    if (Object.values(changes).some(change => change)) {
+      // Create a new version with the changes
+      await doc.createVersion(req.user, changes);
+      
+      // Log the update activity
+      await logActivity('updated', doc, req.user, doc.currentVersion, {
+        ...changes,
+        previousVersion: previousState,
+        newVersion: {
+          title: doc.title,
+          content: doc.content,
+          summary: doc.summary,
+          tags: doc.tags
+        }
+      });
+    }
 
-    res.json(doc);
+    doc.lastUpdatedBy = req.user._id;
+    await doc.save({ session });
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Return the updated document with versions populated
+    const updatedDoc = await Document.findById(doc._id)
+      .populate('createdBy', 'name email')
+      .populate('lastUpdatedBy', 'name email')
+      .populate('versions.editedBy', 'name email');
+      
+    res.json(updatedDoc);
   } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    console.error('Error updating document:', err);
     res.status(500).json({ message: 'Failed to update document', error: err.message });
   }
 };
 
 exports.deleteDocument = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
-    const doc = await Document.findById(req.params.id);
-    if (!doc) return res.status(404).json({ message: 'Document not found' });
-    if (!canModify(req.user, doc)) return res.status(403).json({ message: 'Forbidden' });
-    await doc.deleteOne();
-    await Activity.create({ action: 'deleted', document: doc._id, user: req.user._id });
-    res.json({ success: true });
+    const doc = await Document.findById(req.params.id).session(session);
+    
+    if (!doc) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Document not found' });
+    }
+    
+    if (!canModify(req.user, doc)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+    
+    // Log the deletion activity before actually deleting
+    await logActivity('deleted', doc, req.user);
+    
+    // Soft delete the document
+    await doc.softDelete();
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    res.json({ message: 'Document deleted successfully' });
   } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    console.error('Error deleting document:', err);
     res.status(500).json({ message: 'Failed to delete document', error: err.message });
   }
 };
@@ -192,15 +290,163 @@ exports.forceTags = async (req, res) => {
   }
 };
 
-exports.activityFeed = async (_req, res) => {
+exports.activityFeed = async (req, res) => {
   try {
-    const items = await Activity.find({})
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .populate('user', 'name email')
-      .populate('document', 'title');
-    res.json(items);
+    const { limit = 10, skip = 0 } = req.query;
+    
+    const [activities, total] = await Promise.all([
+      Activity.find()
+        .sort({ createdAt: -1 })
+        .skip(parseInt(skip))
+        .limit(parseInt(limit))
+        .populate('user', 'name email')
+        .populate('document', 'title')
+        .lean(),
+      Activity.countDocuments()
+    ]);
+    
+    // Enhance activities with human-readable messages
+    const enhancedActivities = activities.map(activity => {
+      const actionMap = {
+        created: 'created the document',
+        updated: 'updated the document',
+        deleted: 'deleted the document',
+        version_created: 'created a new version of the document'
+      };
+      
+      return {
+        ...activity,
+        actionText: actionMap[activity.action] || 'performed an action on the document',
+        timestamp: activity.createdAt
+      };
+    });
+    
+    res.json({
+      activities: enhancedActivities,
+      total,
+      hasMore: (parseInt(skip) + activities.length) < total
+    });
   } catch (err) {
-    res.status(500).json({ message: 'Failed to fetch activity', error: err.message });
+    console.error('Error fetching activity feed:', err);
+    res.status(500).json({ message: 'Failed to fetch activity feed', error: err.message });
+  }
+};
+
+// Get version history for a document
+exports.getDocumentVersions = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { limit = 10, skip = 0 } = req.query;
+    
+    const doc = await Document.findById(id)
+      .select('versions')
+      .populate('versions.editedBy', 'name email')
+      .lean();
+    
+    if (!doc) {
+      return res.status(404).json({ message: 'Document not found' });
+    }
+    
+    // Sort versions by version number (descending)
+    const sortedVersions = doc.versions.sort((a, b) => b.versionNumber - a.versionNumber);
+    
+    // Apply pagination
+    const paginatedVersions = sortedVersions.slice(parseInt(skip), parseInt(skip) + parseInt(limit));
+    
+    res.json({
+      versions: paginatedVersions,
+      total: doc.versions.length,
+      hasMore: (parseInt(skip) + paginatedVersions.length) < doc.versions.length
+    });
+  } catch (err) {
+    console.error('Error fetching document versions:', err);
+    res.status(500).json({ message: 'Failed to fetch document versions', error: err.message });
+  }
+};
+
+// Restore a document to a previous version
+exports.restoreVersion = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    const { id, versionNumber } = req.params;
+    
+    const doc = await Document.findById(id).session(session);
+    if (!doc) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Document not found' });
+    }
+    
+    if (!canModify(req.user, doc)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+    
+    // Find the version to restore
+    const versionToRestore = doc.versions.find(v => v.versionNumber === parseInt(versionNumber));
+    if (!versionToRestore) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: 'Version not found' });
+    }
+    
+    // Save current state as a new version before restoring
+    await doc.createVersion(req.user, {
+      title: true,
+      content: true,
+      summary: true,
+      tags: true
+    });
+    
+    // Restore the document to the selected version
+    doc.title = versionToRestore.title;
+    doc.content = versionToRestore.content;
+    doc.summary = versionToRestore.summary;
+    doc.tags = versionToRestore.tags;
+    doc.lastUpdatedBy = req.user._id;
+    
+    await doc.save({ session });
+    
+    // Log the restore activity
+    await logActivity('version_created', doc, req.user, doc.currentVersion, {
+      title: true,
+      content: true,
+      summary: true,
+      tags: true,
+      previousVersion: {
+        title: doc.title,
+        content: doc.content,
+        summary: doc.summary,
+        tags: doc.tags
+      },
+      newVersion: {
+        title: versionToRestore.title,
+        content: versionToRestore.content,
+        summary: versionToRestore.summary,
+        tags: versionToRestore.tags
+      }
+    });
+    
+    await session.commitTransaction();
+    session.endSession();
+    
+    // Return the restored document
+    const updatedDoc = await Document.findById(doc._id)
+      .populate('createdBy', 'name email')
+      .populate('lastUpdatedBy', 'name email')
+      .populate('versions.editedBy', 'name email');
+    
+    res.json({
+      message: 'Document restored to the selected version',
+      document: updatedDoc
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    console.error('Error restoring document version:', err);
+    res.status(500).json({ message: 'Failed to restore document version', error: err.message });
   }
 };
