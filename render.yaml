@@ -1,0 +1,20 @@
+# render.yaml
+services:
+  - type: web
+    name: ai-knowledge-hub-api
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        fromDatabase:
+          name: mongodb
+          property:connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PORT
+        value: 10000
+      - key: GEMINI_API_KEY
+        sync: false  # You'll set this in the dashboard
