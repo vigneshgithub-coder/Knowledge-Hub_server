@@ -15,7 +15,7 @@ const app = express();
 const corsOptions = {
   origin: [
     'http://localhost:3000',  // For local development
-    'https://your-frontend-domain.com',  // Your production frontend URL
+    'https://knowledgehubwithgemini.netlify.app/',  // Your production frontend URL
     /\.onrender\.com$/  // Allow all Render subdomains
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -69,12 +69,12 @@ async function start() {
         useNewUrlParser: true,
         useUnifiedTopology: true,
       });
-      console.log('✅ MongoDB connected');
+      console.log(' MongoDB connected');
     }
 
     app.listen(PORT, () => {
-      console.log(`🚀 Server running on http://localhost:${PORT}`);
-      console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+      console.log(` Server running on http://localhost:${PORT}`);
+      console.log(` Health check: http://localhost:${PORT}/health`);
     });
   } catch (err) {
     console.error('Failed to start server:', err);
